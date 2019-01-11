@@ -90,6 +90,7 @@ import org.eclipse.californium.scandium.config.DtlsConnectorConfig;
 import org.eclipse.californium.scandium.dtls.AlertMessage.AlertDescription;
 import org.eclipse.californium.scandium.dtls.AlertMessage.AlertLevel;
 import org.eclipse.californium.scandium.dtls.cipher.CipherSuite.KeyExchangeAlgorithm;
+import org.eclipse.californium.scandium.dtls.cipher.CipherSuite;
 import org.eclipse.californium.scandium.dtls.cipher.ECDHECryptography;
 import org.eclipse.californium.scandium.dtls.cipher.PseudoRandomFunction;
 import org.eclipse.californium.scandium.dtls.cipher.PseudoRandomFunction.Label;
@@ -107,7 +108,6 @@ import org.slf4j.LoggerFactory;
  */
 public abstract class Handshaker {
 
-	private static final String MESSAGE_DIGEST_ALGORITHM_NAME = "SHA-256";
 	private final Logger LOGGER = LoggerFactory.getLogger(getClass().getName());
 
 	/**
@@ -232,8 +232,6 @@ public abstract class Handshaker {
 	 * @param config the dtls configuration
 	 * @param maxTransmissionUnit the MTU value reported by the network
 	 *            interface the record layer is bound to.
-	 * @throws IllegalStateException if the message digest required for
-	 *             computing the FINISHED message hash cannot be instantiated.
 	 * @throws NullPointerException if session, recordLayer, or config is
 	 *             <code>null</code>.
 	 * @throws IllegalArgumentException if the initial message sequence number
@@ -267,14 +265,6 @@ public abstract class Handshaker {
 		this.session.setMaxTransmissionUnit(maxTransmissionUnit);
 		this.inboundMessageBuffer = new InboundMessageBuffer();
 
-		try {
-			this.md = MessageDigest.getInstance(MESSAGE_DIGEST_ALGORITHM_NAME);
-		} catch (NoSuchAlgorithmException e) {
-			// this cannot happen on a Java SE 7 VM because SHA-256 is mandatory
-			// to implement
-			throw new IllegalStateException(String.format("Message digest algorithm %s is not available on JVM",
-					MESSAGE_DIGEST_ALGORITHM_NAME));
-		}
 		this.rpkStore = config.getRpkTrustStore();
 	}
 
@@ -528,6 +518,23 @@ public abstract class Handshaker {
 	// Methods ////////////////////////////////////////////////////////
 
 	/**
+	 * Initialize message digest for FINISH message.
+	 * 
+	 * @throw IllegalStateException if message digest is not available for this
+	 *        platform. The supported message digest are checked by
+	 *        {@link CipherSuite#isSupported()}.
+	 */
+	protected final void initMessageDigest() {
+		String hashName = session.getCipherSuite().getPseudoRandomFunctionHashName();
+		try {
+			this.md = MessageDigest.getInstance(hashName);
+		} catch (NoSuchAlgorithmException e) {
+			throw new IllegalStateException(
+					String.format("Message digest algorithm %s is not available on JVM", hashName));
+		}
+	}
+
+	/**
 	 * First, generates the master secret from the given premaster secret, set
 	 * it in {@link #session}, and then applying the key expansion on the master
 	 * secret generates a large enough key block to generate the write, MAC and
@@ -554,12 +561,6 @@ public abstract class Handshaker {
 	 *            the master secret.
 	 */
 	protected void calculateKeys(byte[] masterSecret) {
-		// See http://tools.ietf.org/html/rfc5246#section-6.3:
-		//      key_block = PRF(SecurityParameters.master_secret, "key expansion",
-		//                      SecurityParameters.server_random + SecurityParameters.client_random);
-		byte[] seed = ByteArrayUtils.concatenate(serverRandom.getRandomBytes(), clientRandom.getRandomBytes());
-		byte[] data = PseudoRandomFunction.doPRF(masterSecret, Label.KEY_EXPANSION_LABEL, seed);
-
 		/*
 		 * Create keys as suggested in
 		 * http://tools.ietf.org/html/rfc5246#section-6.3:
@@ -571,19 +572,35 @@ public abstract class Handshaker {
 		 * server_write_IV[SecurityParameters.fixed_iv_length]
 		 */
 
+		String prfMacName = session.getCipherSuite().getPseudoRandomFunctionMacName();
 		int macKeyLength = session.getCipherSuite().getMacKeyLength();
 		int encKeyLength = session.getCipherSuite().getEncKeyLength();
 		int fixedIvLength = session.getCipherSuite().getFixedIvLength();
+		int totalLength = (macKeyLength + encKeyLength + fixedIvLength) * 2;
+		// See http://tools.ietf.org/html/rfc5246#section-6.3:
+		//      key_block = PRF(SecurityParameters.master_secret, "key expansion",
+		//                      SecurityParameters.server_random + SecurityParameters.client_random);
+		byte[] seed = ByteArrayUtils.concatenate(serverRandom.getRandomBytes(), clientRandom.getRandomBytes());
+		byte[] data = PseudoRandomFunction.doPRF(prfMacName, masterSecret, Label.KEY_EXPANSION_LABEL, seed, totalLength);
 
-		clientWriteMACKey = new SecretKeySpec(data, 0, macKeyLength, "Mac");
-		serverWriteMACKey = new SecretKeySpec(data, macKeyLength, macKeyLength, "Mac");
 
-		clientWriteKey = new SecretKeySpec(data, 2 * macKeyLength, encKeyLength, "AES");
-		serverWriteKey = new SecretKeySpec(data, (2 * macKeyLength) + encKeyLength, encKeyLength, "AES");
+		int index = 0;
+		int length = macKeyLength;
+		clientWriteMACKey = new SecretKeySpec(data, index, length, "Mac");
+		index += length;
+		serverWriteMACKey = new SecretKeySpec(data, index, length, "Mac");
+		index += length;
 
-		clientWriteIV = new IvParameterSpec(data, (2 * macKeyLength) + (2 * encKeyLength), fixedIvLength);
-		serverWriteIV = new IvParameterSpec(data, (2 * macKeyLength) + (2 * encKeyLength) + fixedIvLength, fixedIvLength);
+		length = encKeyLength;
+		clientWriteKey = new SecretKeySpec(data, index, length, "AES");
+		index += length;
+		serverWriteKey = new SecretKeySpec(data, index, length, "AES");
+		index += length;
 
+		length = fixedIvLength;
+		clientWriteIV = new IvParameterSpec(data, index, length);
+		index += length;
+		serverWriteIV = new IvParameterSpec(data, index, length);
 	}
 
 	/**
@@ -601,8 +618,9 @@ public abstract class Handshaker {
 	 * @return the master secret.
 	 */
 	private byte[] generateMasterSecret(byte[] premasterSecret) {
+		String prfMacName = session.getCipherSuite().getPseudoRandomFunctionMacName();
 		byte[] randomSeed = ByteArrayUtils.concatenate(clientRandom.getRandomBytes(), serverRandom.getRandomBytes());
-		return PseudoRandomFunction.doPRF(premasterSecret, Label.MASTER_SECRET_LABEL, randomSeed);
+		return PseudoRandomFunction.doPRF(prfMacName, premasterSecret, Label.MASTER_SECRET_LABEL, randomSeed);
 	}
 
 	/**
@@ -747,13 +765,14 @@ public abstract class Handshaker {
 	 * @throws HandshakeException
 	 *             if the reassembled fragments cannot be parsed into a valid <code>HandshakeMessage</code>
 	 */
-	protected final HandshakeMessage handleFragmentation(FragmentedHandshakeMessage fragment) throws HandshakeException {
+	protected final HandshakeMessage handleFragmentation(FragmentedHandshakeMessage fragment)
+			throws HandshakeException {
 
 		LOGGER.debug("Processing {} message fragment ...", fragment.getMessageType());
-		HandshakeMessage reassembledMessage = null;
 		int messageSeq = fragment.getMessageSeq();
 		SortedSet<FragmentedHandshakeMessage> existingFragments = fragmentedMessages.get(messageSeq);
 		if (existingFragments == null) {
+			// TODO: limit number of pending fragmented messages!
 			existingFragments = new TreeSet<FragmentedHandshakeMessage>(new Comparator<FragmentedHandshakeMessage>() {
 
 				// @Override
@@ -770,84 +789,83 @@ public abstract class Handshaker {
 			fragmentedMessages.put(messageSeq, existingFragments);
 		}
 		// store fragment together with other fragments of same message_seq
+		// TODO: limit number of fragments per pending message!
 		existingFragments.add(fragment);
-		
-		reassembledMessage = reassembleFragments(messageSeq, existingFragments,
-				fragment.getMessageLength(), fragment.getMessageType(), session);
-		if (reassembledMessage != null) {
-			LOGGER.debug("Successfully re-assembled {} message", reassembledMessage.getMessageType());
+
+		FragmentedHandshakeMessage completedMessage = reassembleFragments(existingFragments);
+		if (completedMessage != null) {
+			HandshakeMessage message = HandshakeMessage.fromByteArray(completedMessage.toByteArray(),
+					session.getParameter(), completedMessage.getPeer());
+			LOGGER.debug("Successfully re-assembled {} message", message.getMessageType());
 			fragmentedMessages.remove(messageSeq);
+			return message;
 		}
 
-		return reassembledMessage;
+		return null;
 	}
 
 	/**
 	 * Reassembles handshake message fragments into the original message.
 	 * 
-	 * @param messageSeq
-	 *            the fragment's message_seq
 	 * @param fragments the fragments to reassemble
-	 * @param totalLength
-	 *            the expected total length of the reassembled fragment
-	 * @param type
-	 *            the type of the handshake message
-	 * @param session
-	 *            the {@link DTLSSession}
-	 * @return the reassembled handshake message (if all fragements are available),
+	 * @return the reassembled handshake message (if all fragments are available),
 	 *         <code>null</code> otherwise.
 	 * @throws HandshakeException
 	 *             if the reassembled fragments cannot be parsed into a valid <code>HandshakeMessage</code>
 	 */
-	private final HandshakeMessage reassembleFragments(
-			int messageSeq,
-			SortedSet<FragmentedHandshakeMessage> fragments,
-			int totalLength,
-			HandshakeType type,
-			DTLSSession session) throws HandshakeException {
+	private final FragmentedHandshakeMessage reassembleFragments(SortedSet<FragmentedHandshakeMessage> fragments)
+			throws HandshakeException {
 
-		HandshakeMessage message = null;
-
-		byte[] reassembly = new byte[] {};
+		Set<FragmentedHandshakeMessage> remove = null;
+		FragmentedHandshakeMessage message = fragments.first();
+		int totalLength = message.getMessageLength();
 		int offset = 0;
 		for (FragmentedHandshakeMessage fragmentedHandshakeMessage : fragments) {
 
 			int fragmentOffset = fragmentedHandshakeMessage.getFragmentOffset();
 			int fragmentLength = fragmentedHandshakeMessage.getFragmentLength();
-
-			if (fragmentOffset == offset) { // eliminate duplicates
-				// case: no overlap
-				reassembly = ByteArrayUtils.concatenate(reassembly, fragmentedHandshakeMessage.fragmentToByteArray());
-				offset = reassembly.length;
-			} else if (fragmentOffset < offset && (fragmentOffset + fragmentLength) > offset) {
-				// case: overlap fragment
-				
-				// determine the offset where the fragment adds new information for the reassembly
-				int newOffset = offset - fragmentOffset;
-				int newLength = fragmentLength - newOffset;
-				byte[] newBytes = new byte[newLength];
-				// take only the new bytes and add them
-				System.arraycopy(fragmentedHandshakeMessage.fragmentToByteArray(), newOffset, newBytes, 0, newLength);
-				reassembly = ByteArrayUtils.concatenate(reassembly, newBytes);
-
-				offset = reassembly.length;
+			if (fragmentOffset > offset) {
+				LOGGER.debug("gap fragment! {} < {}", offset, fragmentOffset);
+				return null;
+			}
+			if (fragmentOffset + fragmentLength <= offset) {
+				LOGGER.debug("overlapping fragment removed!");
+				if (remove == null) {
+					remove = new LinkedHashSet<>();
+				}
+				remove.add(fragmentedHandshakeMessage);
+			} else {
+				offset = fragmentOffset + fragmentLength;
 			}
 		}
-
-		if (reassembly.length == totalLength) {
-			// the reassembled fragment has the expected length
-			FragmentedHandshakeMessage wholeMessage =
-					new FragmentedHandshakeMessage(type, totalLength, messageSeq, 0, reassembly, getPeerAddress());
-			reassembly = wholeMessage.toByteArray();
-
-			HandshakeParameter parameter = null;
-			if (session != null) {
-				parameter = session.getParameter();
-			}
-			message = HandshakeMessage.fromByteArray(reassembly, parameter, getPeerAddress());
+		
+		if (remove != null) {
+			fragments.removeAll(remove);
 		}
 
-		return message;
+		if (offset < totalLength) {
+			LOGGER.debug("incomplete fragment! {} < {}", offset, totalLength);
+			return null;
+		}
+		LOGGER.debug("complete fragment! {} < {}", offset, totalLength);
+
+		byte[] reassembly = new byte[totalLength];
+		offset = 0;
+		for (FragmentedHandshakeMessage fragmentedHandshakeMessage : fragments) {
+
+			int fragmentOffset = fragmentedHandshakeMessage.getFragmentOffset();
+			int fragmentLength = fragmentedHandshakeMessage.getFragmentLength();
+			byte[] fragmentBytes = fragmentedHandshakeMessage.fragmentToByteArray();
+			int srcOffset = offset - fragmentOffset;
+			fragmentLength -= srcOffset;
+			if (fragmentLength > 0) {
+				System.arraycopy(fragmentBytes, srcOffset, reassembly, offset, fragmentLength);
+			}
+			offset += fragmentLength;
+		}
+
+		return new FragmentedHandshakeMessage(message.getMessageType(), totalLength, message.getMessageSeq(), 0,
+				reassembly, message.getPeer());
 	}
 
 	// Getters and Setters ////////////////////////////////////////////
